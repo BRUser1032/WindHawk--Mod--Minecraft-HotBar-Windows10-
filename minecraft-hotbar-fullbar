@@ -2,7 +2,7 @@
 // @id              minecraft-hotbar-win10-fullbar
 // @name            Minecraft Hotbar - Windows 10 (fullbar)
 // @description     Minecraft-style slots on a transparent Windows 10 taskbar - fullbar variant: buttons stay on the left (experimental)
-// @version         0.7.0
+// @version         0.6.1
 // @author          BitRize
 // @include         explorer.exe
 // @architecture    x86-64
@@ -46,15 +46,6 @@ icons are grouped until a slot is about as wide as the taskbar is tall. The
 language indicator and the clock share one slot, and the notification (bell)
 button gets its own. A setting can merge the whole tray into a single slot.
 
-## App-open indicator
-Replacing the button background also removes Windows' "this app is open"
-line. With "nativeRunningIndicator" on, the mod calls Windows' original
-drawing code again, moved up and clipped to a thin strip inside the slot, so
-only that line shows. This is experimental: it assumes the line is drawn by
-the same function the mod hooks. The mod also logs the 12 state bytes of each
-button to the Windhawk log (lines starting with "Button x=") to help find
-out which one means "running".
-
 ## Recommended taskbar settings
 Settings > Personalization > Taskbar > "Combine taskbar buttons":
 "Always, hide labels", so each button is icon-only.
@@ -77,9 +68,6 @@ Settings > Personalization > Taskbar > "Combine taskbar buttons":
 - singleTraySlot: false
   $name: One single slot for the whole tray
   $description: Off = several slots (about 2 icons each). On = chevron, icons, language, clock and notifications all inside one big slot.
-- nativeRunningIndicator: true
-  $name: Show Windows' own "app is open" line inside each slot
-  $description: Lets Windows draw its running-app indicator in the lower part of the slot. Experimental. Turn off if it looks wrong.
 - squareAppSlots: false
   $name: Square app slots (with gaps)
   $description: Off = slots touch each other like the real hotbar (but are slightly wider than tall on Windows 10).
@@ -97,7 +85,6 @@ static bool g_frameStart = true;
 static bool g_frameTray = true;
 static bool g_frameClock = true;
 static bool g_squareAppSlots = false;
-static bool g_nativeIndicator = true;
 static bool g_singleTraySlot = false;
 
 // ===================== Slot style (measured from the Win11 reference) =====================
@@ -295,88 +282,6 @@ static bool BlendSlotOnDC(HDC hdc, const RECT &slot, bool selected, bool pressed
 typedef void (__cdecl *CTaskBtnGroup__DrawBar_t)(void *, HDC, void *, void *);
 CTaskBtnGroup__DrawBar_t CTaskBtnGroup__DrawBar_orig;
 
-// Total thickness (px) of the bottom frame drawn by RenderSlot().
-static int BottomFrame(int side) {
-    return U(1, side) + U(3, side);
-}
-
-// Logs the raw state bytes of each button whenever they change (diagnostics).
-static void LogButtonStates(const RECT &rc, const char *info4, const char *st) {
-    struct Entry {
-        bool used;
-        LONG left;
-        char info[4];
-        char st[12];
-    };
-    static Entry cache[24];
-    static int next = 0;
-
-    int idx = -1;
-    for (int i = 0; i < 24; i++) {
-        if (cache[i].used && cache[i].left == rc.left) {
-            idx = i;
-            break;
-        }
-    }
-    if (idx < 0) {
-        idx = next;
-        next = (next + 1) % 24;
-        cache[idx].used = false;
-    }
-    if (cache[idx].used &&
-        memcmp(cache[idx].info, info4, 4) == 0 &&
-        memcmp(cache[idx].st, st, 12) == 0) {
-        return;
-    }
-
-    cache[idx].used = true;
-    cache[idx].left = rc.left;
-    memcpy(cache[idx].info, info4, 4);
-    memcpy(cache[idx].st, st, 12);
-
-    Wh_Log(L"Button x=%d info=%02x%02x%02x%02x states=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-           (int)rc.left,
-           (unsigned)(unsigned char)info4[0], (unsigned)(unsigned char)info4[1],
-           (unsigned)(unsigned char)info4[2], (unsigned)(unsigned char)info4[3],
-           (unsigned)(unsigned char)st[0], (unsigned)(unsigned char)st[1],
-           (unsigned)(unsigned char)st[2], (unsigned)(unsigned char)st[3],
-           (unsigned)(unsigned char)st[4], (unsigned)(unsigned char)st[5],
-           (unsigned)(unsigned char)st[6], (unsigned)(unsigned char)st[7],
-           (unsigned)(unsigned char)st[8], (unsigned)(unsigned char)st[9],
-           (unsigned)(unsigned char)st[10], (unsigned)(unsigned char)st[11]);
-}
-
-// Lets Windows' original drawing run again, but only inside a thin strip just
-// above the bottom frame of the slot, so only its "app is open" line shows.
-static void DrawNativeIndicator(void *pThis, HDC hDC, void *pRenderInfo,
-                                void *pRenderStates, const RECT &slot) {
-    int w = slot.right - slot.left;
-    int h = slot.bottom - slot.top;
-    int side = (w < h) ? w : h;
-    if (side < 16) {
-        return;
-    }
-
-    RECT *dest = (RECT *)((char *)pRenderInfo + 4);
-    RECT saved = *dest;
-
-    LONG newBottom = slot.bottom - BottomFrame(side) - 1;
-    int inset = U(4, side);
-    int strip = U(6, side);
-
-    // Move the drawn rect up so the line lands inside the slot, then restore
-    // it: explorer still uses the rect afterwards to place the icon.
-    dest->bottom = newBottom;
-
-    SaveDC(hDC);
-    IntersectClipRect(hDC, slot.left + inset, newBottom - strip,
-                      slot.right - inset, newBottom + 1);
-    CTaskBtnGroup__DrawBar_orig(pThis, hDC, pRenderInfo, pRenderStates);
-    RestoreDC(hDC, -1);
-
-    *dest = saved;
-}
-
 void __cdecl CTaskBtnGroup__DrawBar_hook(
     void *pThis,
     HDC hDC,
@@ -400,21 +305,13 @@ void __cdecl CTaskBtnGroup__DrawBar_hook(
     }
 
     RECT slot = AppSlot(*prc);
-
-    LogButtonStates(*prc, (const char *)pRenderInfo, st);
-
     if (!BlendSlotOnDC(hDC, slot, selected, pressed)) {
         // Could not draw our slot: let explorer draw the normal button.
         CTaskBtnGroup__DrawBar_orig(pThis, hDC, pRenderInfo, pRenderStates);
-        return;
     }
 
-    if (g_nativeIndicator) {
-        DrawNativeIndicator(pThis, hDC, pRenderInfo, pRenderStates, slot);
-    }
-
-    // The rest of the original button background is intentionally not drawn:
-    // we replace it with the slot. Icon and text are drawn afterwards.
+    // On success the original is intentionally not called: we replace the
+    // button background. Icon and text are drawn afterwards by explorer.
 }
 
 // ===================== Taskbar transparency =====================
@@ -927,7 +824,6 @@ BOOL Wh_ModInit(void) {
     g_frameTray = Wh_GetIntSetting(L"frameTray") != 0;
     g_frameClock = Wh_GetIntSetting(L"frameClock") != 0;
     g_squareAppSlots = Wh_GetIntSetting(L"squareAppSlots") != 0;
-    g_nativeIndicator = Wh_GetIntSetting(L"nativeRunningIndicator") != 0;
     g_singleTraySlot = Wh_GetIntSetting(L"singleTraySlot") != 0;
 
     HMODULE hExplorer = GetModuleHandleW(NULL);
